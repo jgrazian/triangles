@@ -1,26 +1,20 @@
-use glam::DVec2;
-
 mod types;
 mod util;
 
 use types::*;
 use util::*;
 
-pub fn triangulate(points: Vec<DVec2>) -> (Triangulation, HullContext) {
+pub fn triangulate(points: Vec<impl Into<Vertex>>) -> (Triangulation, HullContext) {
+    let points = points.into_iter().map(Into::into).collect::<Vec<_>>();
     let mut triangulation = Triangulation::new(points);
     let mut hull = triangulation.context();
     triangulation.update_with(&mut hull);
     (triangulation, hull)
 }
 
-pub struct Edge<'t> {
-    p0: &'t DVec2,
-    p1: &'t DVec2,
-}
-
 #[derive(Debug)]
 pub struct Triangulation {
-    points: Vec<DVec2>,
+    points: Vec<Vertex>,
     triangles: Vec<VertIndex>,
     half_edges: Vec<Option<EdgeIndex>>,
     hull: Vec<VertIndex>,
@@ -28,7 +22,7 @@ pub struct Triangulation {
 
 /// Port of https://github.com/mapbox/delaunator/blob/main/index.js
 impl Triangulation {
-    fn new(points: Vec<DVec2>) -> Self {
+    fn new(points: Vec<Vertex>) -> Self {
         let n = points.len();
         let max_triangles = (2 * n - 5).max(0);
 
@@ -40,15 +34,21 @@ impl Triangulation {
         }
     }
 
-    pub fn edges(&self) -> impl Iterator<Item = Edge<'_>> + '_ {
+    pub fn edges(&self) -> impl Iterator<Item = (Vertex, Vertex)> + '_ {
         self.half_edges
             .iter()
             .enumerate()
-            .filter(|(e, opposite)| opposite.map(|o| *o < *e).unwrap_or(true))
-            .map(|(e, _)| Edge {
-                p0: &self.points[self.triangles[e]],
-                p1: &self.points[self.triangles[Self::next_half_edge(e.into())]],
+            .filter(|(e, opposite)| opposite.map(|o| *e > *o).unwrap_or(true))
+            .map(|(e, _)| {
+                (
+                    self.points[self.triangles[e]],
+                    self.points[self.triangles[Self::next_half_edge(e.into())]],
+                )
             })
+    }
+
+    pub fn vertices(&self) -> impl Iterator<Item = Vertex> + '_ {
+        self.triangles.iter().map(|t| self.points[*t])
     }
 
     pub fn next_half_edge(e: EdgeIndex) -> EdgeIndex {
@@ -92,10 +92,10 @@ impl Triangulation {
                 let dists = self
                     .points
                     .iter()
-                    .map(|p| (p.x - self.points[0].x) + (p.y - self.points[0].y))
+                    .map(|p| (p.x() - self.points[0].x()) + (p.y() - self.points[0].y()))
                     .collect::<Vec<_>>();
 
-                ids.sort_unstable_by(|&a, &b| dists[a].total_cmp(&dists[b]));
+                ids.sort_by(|&a, &b| dists[a].total_cmp(&dists[b]));
 
                 let mut d0 = f64::NEG_INFINITY;
                 for id in ids {
@@ -118,13 +118,12 @@ impl Triangulation {
             .map(|p| p.distance_squared(center))
             .collect::<Vec<_>>();
         // sort the points by distance from the seed triangle circumcenter
-        ids.sort_unstable_by(|&a, &b| dists[a].total_cmp(&dists[b]));
+        ids.sort_by(|&a, &b| dists[a].total_cmp(&dists[b]));
 
         hull.seed((p0, p1, p2), (i0, i1, i2), center);
 
         let mut triangles_len = 0;
         self.add_triangle(&mut triangles_len, seed, TriTriple::NONE);
-
         let mut p_prev = None;
         'a: for i in ids {
             let p = self.points[i];
@@ -298,56 +297,53 @@ impl Triangulation {
             let al = a0 + (a + 1) % 3;
             let bl = (b0 + (*b + 2) % 3).into();
 
-            let p0 = self.triangles[ar];
-            let pr = self.triangles[a];
-            let pl = self.triangles[al];
-            let p1 = self.triangles[bl];
+            let p0: VertIndex = self.triangles[ar];
+            let pr: VertIndex = self.triangles[a];
+            let pl: VertIndex = self.triangles[al];
+            let p1: VertIndex = self.triangles[bl];
 
-            match in_circle(
+            if in_circle(
                 self.points[p0],
                 self.points[pr],
                 self.points[pl],
                 self.points[p1],
             ) {
-                true => {
-                    self.triangles[a] = p1;
-                    self.triangles[b] = p0;
+                self.triangles[a] = p1;
+                self.triangles[b] = p0;
 
-                    let hbl: Option<EdgeIndex> = self.half_edges[bl];
+                let hbl: Option<EdgeIndex> = self.half_edges[bl];
 
-                    // edge swapped on the other side of the hull (rare); fix the halfedge reference
-                    if hbl.is_none() {
-                        let mut e = hull.start;
-                        loop {
-                            if hull.tri[e] == bl {
-                                hull.tri[e] = a.into();
-                                break;
-                            }
-                            e = hull.prev[e];
-                            if e == hull.start {
-                                break;
-                            }
+                // edge swapped on the other side of the hull (rare); fix the halfedge reference
+                if hbl.is_none() {
+                    let mut e = hull.start;
+                    loop {
+                        if hull.tri[e] == bl {
+                            hull.tri[e] = a.into();
+                            break;
+                        }
+                        e = hull.prev[e];
+                        if e == hull.start {
+                            break;
                         }
                     }
-                    self.link(a, hbl);
-                    self.link(*b, self.half_edges[ar]);
-                    self.link(ar, Some(bl));
-
-                    let br = b0 + (*b + 1) % 3;
-
-                    // don't worry about hitting the cap: it can only happen on extremely degenerate input
-                    if i < hull.edge_stack.len() {
-                        hull.edge_stack[i] = br;
-                        i += 1;
-                    }
                 }
-                false => {
-                    if i == 0 {
-                        break;
-                    }
-                    i -= 1;
-                    a = hull.edge_stack[i];
+                self.link(a, hbl);
+                self.link(*b, self.half_edges[ar]);
+                self.link(ar, Some(bl));
+
+                let br = b0 + (*b + 1) % 3;
+
+                // don't worry about hitting the cap: it can only happen on extremely degenerate input
+                if i < hull.edge_stack.len() {
+                    hull.edge_stack[i] = br;
+                    i += 1;
                 }
+            } else {
+                if i == 0 {
+                    break;
+                }
+                i -= 1;
+                a = hull.edge_stack[i];
             }
         }
         ar.into()
@@ -384,9 +380,9 @@ impl HullContext {
 
     fn seed(
         &mut self,
-        (p0, p1, p2): (DVec2, DVec2, DVec2),
+        (p0, p1, p2): (Vertex, Vertex, Vertex),
         (i0, i1, i2): (VertIndex, VertIndex, VertIndex),
-        center: DVec2,
+        center: Vertex,
     ) {
         self.next[i0] = i1;
         self.next[i1] = i2;
@@ -414,16 +410,16 @@ impl HullContext {
 mod tests {
     use super::*;
 
-    const POINTS: [DVec2; 7] = [
+    const POINTS: [Vertex; 7] = [
         // Outer Square
-        DVec2::new(0.0, 0.0),
-        DVec2::new(1.0, 0.0),
-        DVec2::new(0.0, 1.0),
-        DVec2::new(1.0, 1.0),
+        Vertex::new(0.0, 0.0),
+        Vertex::new(1.0, 0.0),
+        Vertex::new(0.0, 1.0),
+        Vertex::new(1.0, 1.0),
         // Inner Triangle
-        DVec2::new(0.3, 0.4),
-        DVec2::new(0.5, 0.7),
-        DVec2::new(0.7, 0.4),
+        Vertex::new(0.3, 0.4),
+        Vertex::new(0.5, 0.7),
+        Vertex::new(0.7, 0.4),
     ];
 
     #[test]
@@ -431,18 +427,18 @@ mod tests {
         // Normal case
         assert_eq!(
             circumradius(
-                DVec2::new(0.0, 0.0),
-                DVec2::new(1.0, 0.0),
-                DVec2::new(0.0, 1.0),
+                Vertex::new(0.0, 0.0),
+                Vertex::new(1.0, 0.0),
+                Vertex::new(0.0, 1.0),
             ),
             0.5
         );
 
         // Degenerate case
         assert!(circumradius(
-            DVec2::new(0.0, 0.0),
-            DVec2::new(0.0, 1.0),
-            DVec2::new(0.0, 2.0),
+            Vertex::new(0.0, 0.0),
+            Vertex::new(0.0, 1.0),
+            Vertex::new(0.0, 2.0),
         )
         .is_nan());
     }
@@ -452,18 +448,18 @@ mod tests {
         // Normal case
         assert_eq!(
             circumcenter(
-                DVec2::new(0.0, 0.0),
-                DVec2::new(1.0, 0.0),
-                DVec2::new(std::f64::consts::FRAC_PI_4, std::f64::consts::FRAC_PI_4),
+                Vertex::new(0.0, 0.0),
+                Vertex::new(1.0, 0.0),
+                Vertex::new(std::f64::consts::FRAC_PI_4, std::f64::consts::FRAC_PI_4),
             ),
-            DVec2::new(0.5, 0.2853981633974483)
+            Vertex::new(0.5, 0.2853982)
         );
 
         // Degenerate case
         assert!(circumcenter(
-            DVec2::new(0.0, 0.0),
-            DVec2::new(0.0, 1.0),
-            DVec2::new(0.0, 2.0),
+            Vertex::new(0.0, 0.0),
+            Vertex::new(0.0, 1.0),
+            Vertex::new(0.0, 2.0),
         )
         .is_nan());
     }
@@ -483,10 +479,11 @@ mod tests {
     #[test]
     fn test_delaunator() {
         let points = POINTS.into();
-        let d = Triangulation::new(points);
+        let mut d = Triangulation::new(points);
+        d.update();
         assert_eq!(
             d.triangles(),
-            [0, 4, 6, 2, 0, 1, 4, 0, 6, 0, 1, 6, 6, 1, 0, 5, 2, 3, 1, 3, 2, 5, 3, 2]
+            [5, 6, 4, 6, 0, 4, 4, 2, 5, 3, 1, 6, 6, 1, 0, 0, 2, 4, 5, 3, 6, 2, 3, 5]
                 .into_iter()
                 .map(|v| v.into())
                 .collect::<Vec<_>>()
@@ -495,8 +492,8 @@ mod tests {
         assert_eq!(
             d.half_edges(),
             [
-                6isize, 8, 14, -1, 13, 20, 0, 11, 1, -1, 12, 7, 10, 4, 2, 23, 19, 21, -1, 16, 5,
-                17, -1, 15
+                20isize, 5, 8, 14, 17, 1, 16, 23, 2, -1, 12, 19, 10, -1, 3, -1, 6, 4, 22, 11, 0,
+                -1, 18, 7
             ]
             .into_iter()
             .map(|v| match v {
@@ -508,7 +505,7 @@ mod tests {
 
         assert_eq!(
             d.hull(),
-            [1, 3, 2, 0]
+            [2, 3, 1, 0]
                 .into_iter()
                 .map(|v| v.into())
                 .collect::<Vec<_>>()
